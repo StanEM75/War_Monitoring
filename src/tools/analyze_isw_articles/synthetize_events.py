@@ -4,6 +4,7 @@ from datetime import date
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 
 import requests
@@ -26,15 +27,17 @@ An assault followed by territorial losses does not by itself prove the assault c
 For each event select start_date and end_date ONLY from the supplied reporting_dates.
 Dates are reporting dates, not necessarily actual occurrence dates. Use null for BOTH dates
 when an event cannot be dated from the input; do not invent a date.
-Provide one or more exact evidence_quotes copied from the supplied text supporting each event.
+For each event, return one or more evidence_ids from the supplied evidence_segments.
+Choose only segments actually supporting the summary. Do not invent evidence identifiers.
+The application will recover the exact original text of each cited segment.
 Return no events when there are no substantive events. Do not include outside knowledge.'''
 SCHEMA = {'type': 'object', 'properties': {'events': {'type': 'array', 'items': {
     'type': 'object', 'properties': {
         'start_date': {'type': ['string', 'null']},
         'end_date': {'type': ['string', 'null']},
         'summary': {'type': 'string'},
-        'evidence_quotes': {'type': 'array', 'items': {'type': 'string'}}},
-    'required': ['start_date', 'end_date', 'summary', 'evidence_quotes'],
+        'evidence_ids': {'type': 'array', 'items': {'type': 'string'}}},
+    'required': ['start_date', 'end_date', 'summary', 'evidence_ids'],
     'additionalProperties': False}}}, 'required': ['events'], 'additionalProperties': False}
 
 
@@ -82,21 +85,84 @@ class OpenAISynthesizer:
             raise ValueError('Set OPENAI_API_KEY before synthesis.')
 
     def __call__(self, paragraph, dates):
-        response = requests.post('https://api.openai.com/v1/responses',
-            headers={'Authorization': f'Bearer {self.key}'},
-            json={'model': self.model, 'store': False, 'instructions': PROMPT,
-                  'input': json.dumps({'title': paragraph['title'], 'text': paragraph['text'],
-                                       'reporting_dates': list(dates)}, ensure_ascii=False),
-                  'text': {'format': {'type': 'json_schema', 'name': 'isw_events',
-                                      'strict': True, 'schema': SCHEMA}}}, timeout=180)
-        if not response.ok:
-            raise RuntimeError(f'OpenAI API returned HTTP {response.status_code}; rerun to resume.')
-        payload = response.json()
-        if payload.get('status') != 'completed':
-            raise ValueError('AI response incomplete; no new report published.')
-        text = ''.join(part['text'] for item in payload.get('output', [])
-                       for part in item.get('content', []) if part.get('type') == 'output_text')
-        return json.loads(text)
+        # Segment without deleting or rewriting any original characters.
+        segments = {}
+        remaining = paragraph['text']
+        while remaining:
+            cut = len(remaining) if len(remaining) <= 1200 else remaining.rfind(' ', 0, 1200)
+            if cut <= 0:
+                cut = min(1200, len(remaining))
+            segments[f"E{len(segments) + 1:05d}"] = remaining[:cut]
+            remaining = remaining[cut:]
+        feedback = ''
+        for attempt in range(3):
+            response = requests.post('https://api.openai.com/v1/responses',
+                headers={'Authorization': f'Bearer {self.key}'},
+                json={'model': self.model, 'store': False, 'instructions': PROMPT + feedback,
+                      'reasoning': {'effort': 'low'},
+                      'input': json.dumps({'title': paragraph['title'], 'evidence_segments': segments,
+                                           'reporting_dates': list(dates)}, ensure_ascii=False),
+                      'text': {'format': {'type': 'json_schema', 'name': 'isw_events',
+                                          'strict': True, 'schema': SCHEMA}}}, timeout=180)
+            if not response.ok:
+                code = response.json().get('error', {}).get('code')
+                raise RuntimeError(f'OpenAI API returned HTTP {response.status_code} ({code}); rerun to resume.')
+            payload = response.json()
+            if payload.get('status') != 'completed':
+                raise ValueError('AI response incomplete; no new report published.')
+            text = ''.join(part['text'] for item in payload.get('output', [])
+                           for part in item.get('content', []) if part.get('type') == 'output_text')
+            try:
+                result = json.loads(text)
+                for event in result.get('events', []):
+                    ids = event.get('evidence_ids')
+                    if not isinstance(ids, list) or not ids or any(not isinstance(i, str) or i not in segments for i in ids):
+                        raise ValueError('Choose valid evidence_ids from evidence_segments.')
+                    event['evidence_quotes'] = [segments[i] for i in ids]
+                return validate_events(result, paragraph, dates)
+            except (ValueError, TypeError) as error:
+                if attempt == 2:
+                    raise ValueError('AI output failed evidence/date checks after three attempts; no new report published.') from error
+                feedback = ('\nThe previous output failed validation: ' + str(error)
+                            + '\nRegenerate a smaller set of strongly supported events. For each quote, '
+                              'select existing evidence_ids from evidence_segments rather than inventing excerpts. '
+                              'Use only the supplied reporting dates or null.')
+                print(f"Retrying evidence validation for {paragraph['title']} (attempt {attempt + 2}/3)", flush=True)
+
+
+def synthesis_parts(paragraph, input_path, max_chars=1800000, batch_chars=700000):
+    """Split large groups at original article boundaries, preserving text and dates.
+
+    Arguments: organized paragraph, input path, direct-call and batch character limits.
+    Purpose: Keep large conflict histories below model context limits without truncation.
+    Output: Ordered paragraphs with the original per-article provenance.
+    Used in: synthetize_events.
+    """
+    if len(paragraph['text']) <= max_chars:
+        return [paragraph]
+    source = Path(input_path).parent / 'sw_articles_deduplicated.json'
+    raw = json.loads(source.read_text(encoding='utf-8'))['articles']
+    lookup = {item['url']: item for item in raw}
+    pieces = []
+    for metadata in paragraph.get('articles', []):
+        if metadata.get('url') not in lookup:
+            raise ValueError('Large-group splitting requires every original article in the deduplicated input.')
+        text = re.sub(r'\s+', ' ', lookup[metadata['url']]['text']).strip()
+        pieces.append((text + (' ' + metadata['date'] if metadata.get('date') else ''), metadata))
+    if ' '.join(text for text, _ in pieces) != paragraph['text']:
+        raise ValueError('Original article texts do not match the organized group; regenerate organization.')
+    parts, texts, metadata_rows = [], [], []
+    for text, metadata in pieces:
+        if len(text) > max_chars:
+            raise ValueError('A single article exceeds the safe synthesis size; no text was truncated.')
+        if texts and sum(map(len, texts)) + len(text) > batch_chars:
+            parts.append({'title': paragraph['title'], 'text': ' '.join(texts), 'articles': metadata_rows})
+            texts, metadata_rows = [], []
+        texts.append(text)
+        metadata_rows.append(metadata)
+    if texts:
+        parts.append({'title': paragraph['title'], 'text': ' '.join(texts), 'articles': metadata_rows})
+    return parts
 
 
 def synthetize_events(input_path=DEFAULT_INPUT, output_path=DEFAULT_OUTPUT,
@@ -123,23 +189,29 @@ def synthetize_events(input_path=DEFAULT_INPUT, output_path=DEFAULT_OUTPUT,
         if not isinstance(paragraph, dict) or any(not isinstance(paragraph.get(k), str) or not paragraph[k].strip() for k in ('title', 'text')):
             raise ValueError('Each paragraph requires nonempty title and text.')
         dates = reporting_dates(paragraph)
-        key = hashlib.sha256(json.dumps([PROMPT, SCHEMA, model, paragraph], sort_keys=True).encode()).hexdigest()
-        if key not in cache:
-            cache[key] = validate_events(synthesizer(paragraph, dates), paragraph, dates)
-            save_json(cache_path, cache)
-        events = validate_events(cache[key], paragraph, dates)['events']
+        events = []
+        parts = synthesis_parts(paragraph, input_path)
+        for part_index, part in enumerate(parts, 1):
+            part_dates = reporting_dates(part)
+            key = hashlib.sha256(json.dumps([PROMPT, SCHEMA, model, part], sort_keys=True).encode()).hexdigest()
+            if key not in cache:
+                print(f"Synthesizing {paragraph['title']} (batch {part_index}/{len(parts)})", flush=True)
+                cache[key] = validate_events(synthesizer(part, part_dates), part, part_dates)
+                save_json(cache_path, cache)
+            events.extend(validate_events(cache[key], part, part_dates)['events'])
         events = sorted(events, key=lambda e: (e['start_date'] is None, dates.get(e['start_date'], date.max), dates.get(e['end_date'], date.max)))
         formatted = [{**event, 'formatted': (
             f"{event['start_date']} - {event['end_date']}" if event['start_date'] else 'Undated'
         ) + ': ' + event['summary']} for event in events]
         ordered = sorted(dates, key=dates.get)
+        print(f"Validated synthesis: {paragraph['title']} ({len(formatted)} events)", flush=True)
         groups.append({'title': paragraph['title'],
                        'period_start': ordered[0] if ordered else None,
                        'period_end': ordered[-1] if ordered else None,
                        'events': formatted, 'articles': paragraph.get('articles', [])})
     result = {'titles': groups, 'metadata': {'model': model, 'input': str(input_path.resolve()),
               'date_meaning': 'Reporting dates, not necessarily event occurrence dates.',
-              'limitations': 'AI synthesis is probabilistic; exact excerpts and date checks do not guarantee factual correctness.'}}
+              'limitations': 'AI synthesis is probabilistic; exact excerpts and date checks do not guarantee factual correctness. Large title groups are summarized in article-boundary batches; related events can recur across batches.'}}
     save_json(output_path, result)
     return result
 

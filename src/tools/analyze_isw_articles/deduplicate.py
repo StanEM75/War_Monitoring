@@ -1,5 +1,8 @@
 """Conservative, resumable AI semantic deduplication of ISW articles."""
 import argparse
+from collections import Counter
+import math
+import re
 import hashlib
 import json
 import os
@@ -50,6 +53,47 @@ def validate(decision):
     return decision
 
 
+def article_vectors(articles):
+    """Build unit-length sparse TF-IDF vectors locally from complete article texts.
+
+    Arguments: articles, validated article records.
+    Purpose: Rank possible duplicates without a paid API call.
+    Output: One sparse token-weight dictionary per article.
+    Used in: analyze.
+    """
+    counts = [Counter(re.findall(r"[a-z][a-z0-9]{2,}", a['text'].casefold())) for a in articles]
+    frequencies = Counter(token for row in counts for token in row)
+    vectors = []
+    for row in counts:
+        weights = {token: (1 + math.log(count)) * (1 + math.log((1 + len(articles)) / (1 + frequencies[token])))
+                   for token, count in row.items()}
+        norm = math.sqrt(sum(value * value for value in weights.values()))
+        vectors.append({token: value / norm for token, value in weights.items()} if norm else {})
+    return vectors
+
+
+def similar_references(candidate_index, retained_indices, vectors, limit, minimum):
+    """Rank retained articles by cosine similarity; never exclude an article here.
+
+    Arguments: candidate index, retained indices, unit vectors, maximum matches,
+        minimum similarity. A zero limit selects all references for exhaustive mode.
+    Purpose: Restrict expensive AI comparisons to the most plausible duplicates.
+    Output: Ordered list of (reference index, local similarity) pairs.
+    Used in: analyze.
+    """
+    if limit == 0:
+        return [(i, None) for i in retained_indices]
+    candidate = vectors[candidate_index]
+    scored = []
+    for index in retained_indices:
+        reference = vectors[index]
+        smaller, larger = (candidate, reference) if len(candidate) < len(reference) else (reference, candidate)
+        score = min(1.0, sum(value * larger.get(token, 0) for token, value in smaller.items()))
+        if score >= minimum:
+            scored.append((index, score))
+    return sorted(scored, key=lambda pair: (-pair[1], pair[0]))[:limit]
+
+
 class OpenAIJudge:
     """Compare complete article pairs using the Responses API and structured output."""
     def __init__(self, model, api_key=None):
@@ -76,11 +120,13 @@ class OpenAIJudge:
         return validate(json.loads(text))
 
 
-def analyze(input_path, output_path, cache_path, judge, model, threshold=0.95, max_calls=100):
+def analyze(input_path, output_path, cache_path, judge, model, threshold=0.95, max_calls=100,
+            candidate_limit=3, min_similarity=0.55):
     """Compare each article to retained representatives; cache every valid decision.
 
     Arguments: input/output/cache paths; judge callable; model ID; confidence threshold;
-        max_calls, the maximum number of new comparisons allowed for this invocation.
+        max_calls, the maximum new comparisons; candidate_limit, maximum local matches
+        per article (0 for exhaustive); min_similarity, local TF-IDF cosine cutoff.
     Purpose: Exclude only high-confidence semantic repetitions while preserving updates.
     Output: Report dictionary and separate JSON report; the source file is never changed.
     Used in: main and offline tests.
@@ -88,7 +134,8 @@ def analyze(input_path, output_path, cache_path, judge, model, threshold=0.95, m
     paths = [Path(p).resolve() for p in (input_path, output_path, cache_path)]
     if len(set(paths)) != 3:
         raise ValueError('Input, output and cache must be different files.')
-    if not 0 <= threshold <= 1 or max_calls < 0:
+    if (not 0 <= threshold <= 1 or max_calls < 0 or candidate_limit < 0
+            or not 0 <= min_similarity <= 1):
         raise ValueError('Invalid threshold or API call budget.')
     source = json.loads(paths[0].read_text(encoding='utf-8'))
     articles = source['articles']
@@ -100,9 +147,14 @@ def analyze(input_path, output_path, cache_path, judge, model, threshold=0.95, m
     cache = json.loads(paths[2].read_text(encoding='utf-8')) if paths[2].exists() else {}
     kept, excluded, comparisons = [], [], []
     calls = 0
-    for candidate in articles:
+    retained_indices = []
+    vectors = article_vectors(articles) if candidate_limit else []
+    for candidate_index, candidate in enumerate(articles):
         duplicate = None
-        for reference in kept:
+        selected = similar_references(candidate_index, retained_indices, vectors,
+                                      candidate_limit, min_similarity)
+        for reference_index, similarity in selected:
+            reference = articles[reference_index]
             # Cache changes automatically when content, model, schema or instructions change.
             material = json.dumps([PROMPT, SCHEMA, model, reference, candidate], sort_keys=True)
             key = hashlib.sha256(material.encode()).hexdigest()
@@ -113,7 +165,7 @@ def analyze(input_path, output_path, cache_path, judge, model, threshold=0.95, m
                 calls += 1
                 save_json(paths[2], cache)
             decision = validate(cache[key])
-            comparisons.append({'reference_url': reference['url'], 'candidate_url': candidate['url'], **decision})
+            comparisons.append({'reference_url': reference['url'], 'candidate_url': candidate['url'], 'local_similarity': similarity, **decision})
             if decision['relation'] == 'redundant' and decision['confidence'] >= threshold:
                 duplicate = {'url': candidate['url'], 'duplicate_of': reference['url'], **decision}
                 break
@@ -121,11 +173,15 @@ def analyze(input_path, output_path, cache_path, judge, model, threshold=0.95, m
             excluded.append(duplicate)
         else:
             kept.append(candidate)
+            retained_indices.append(candidate_index)
+        print(f"Article {candidate_index + 1}/{len(articles)}; new API calls: {calls}", flush=True)
     result = {'articles': kept, 'excluded': excluded, 'comparisons': comparisons,
               'metadata': {'input': str(paths[0]), 'model': model, 'threshold': threshold,
                            'new_api_calls': calls, 'input_articles': len(articles),
                            'confidence_note': 'Model self-assessment, not a calibrated probability.',
-                           'method': 'Full-text comparisons to retained representatives, in input order.'}}
+                           'method': 'Local TF-IDF shortlist followed by full-text AI comparisons.' if candidate_limit else 'Exhaustive full-text AI comparisons.',
+                           'candidate_limit': candidate_limit, 'min_similarity': min_similarity,
+                           'limitation': 'Unselected pairs are not judged; some paraphrased duplicates may remain. Local similarity never excludes articles.'}}
     save_json(paths[1], result)
     return result
 
@@ -139,12 +195,14 @@ def main():
     parser.add_argument('--model', required=True)
     parser.add_argument('--threshold', type=float, default=0.95)
     parser.add_argument('--max-calls', type=int, default=100)
+    parser.add_argument('--candidate-limit', type=int, default=3)
+    parser.add_argument('--min-similarity', type=float, default=0.55)
     args = parser.parse_args()
     output = args.output or DEFAULT_INPUT.with_name('sw_articles_deduplicated.json')
     cache = args.cache or args.input.parent / 'analyze_isw_articles/comparison_cache.json'
     try:
         report = analyze(args.input, output, cache, OpenAIJudge(args.model), args.model,
-                         args.threshold, args.max_calls)
+                         args.threshold, args.max_calls, args.candidate_limit, args.min_similarity)
     except (ValueError, KeyError, OSError, RuntimeError, requests.RequestException) as error:
         parser.exit(1, f'{error}\n')
     print(f"Retained: {len(report['articles'])}; excluded: {len(report['excluded'])}; output: {output}")
